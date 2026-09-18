@@ -2,14 +2,23 @@ import pg from 'pg';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 
+const envFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env';
+dotenv.config({ path: envFile });
 dotenv.config();
 
 const { Pool, Client } = pg;
 
 const connectionString = process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/hxssan_studio';
+const isProduction = process.env.NODE_ENV === 'production';
+const useSSL = process.env.DATABASE_SSL === 'true' || (isProduction && !connectionString.includes('localhost') && !connectionString.includes('127.0.0.1'));
 
 // Helper to ensure target database exists
 async function ensureDatabaseExists() {
+  // Only check and create database on local PostgreSQL instances
+  if (!connectionString.includes('localhost') && !connectionString.includes('127.0.0.1')) {
+    return;
+  }
+
   try {
     const url = new URL(connectionString);
     const dbName = url.pathname.replace(/^\//, '');
@@ -40,8 +49,9 @@ async function ensureDatabaseExists() {
 
 export const pool = new Pool({
   connectionString,
-  max: 10,
+  max: isProduction ? 20 : 10,
   idleTimeoutMillis: 30000,
+  ssl: useSSL ? { rejectUnauthorized: false } : false,
 });
 
 export async function initDB() {

@@ -1,4 +1,4 @@
-import { Router, Response } from 'express';
+import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { pool } from '../db.js';
@@ -6,7 +6,7 @@ import { requireAdmin, AuthRequest } from '../middleware/auth.js';
 
 const router = Router();
 
-router.post('/login', async (req, res): Promise<void> => {
+router.post('/login', async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body;
 
