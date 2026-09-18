@@ -8,23 +8,45 @@ dotenv.config();
 
 const { Pool, Client } = pg;
 
-const connectionString = process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/hxssan_studio';
-const isProduction = process.env.NODE_ENV === 'production';
-const useSSL = process.env.DATABASE_SSL === 'true' || (isProduction && !connectionString.includes('localhost') && !connectionString.includes('127.0.0.1'));
+const rawConnectionString = process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/hxssan_studio';
 
-// Helper to ensure target database exists
+// Strip sslmode/ssl query parameters to prevent pg-connection-string from overriding explicit SSL config
+const cleanConnectionString = rawConnectionString
+  .replace(/[?&]sslmode=[^&]+/gi, '')
+  .replace(/[?&]ssl=[^&]+/gi, '')
+  .replace(/\?$/, '');
+
+const isLocalhost = cleanConnectionString.includes('localhost') || cleanConnectionString.includes('127.0.0.1');
+// Render internal hostnames: starts with dpg- and does NOT contain .render.com
+const isRenderInternal = cleanConnectionString.includes('dpg-') && !cleanConnectionString.includes('.render.com');
+
+// SSL configuration:
+// - Render internal VPC connections MUST NOT use SSL (will be terminated unexpectedly if attempted)
+// - Localhost connections do not use SSL
+// - Render external connections (.render.com) or cloud hosts require SSL with rejectUnauthorized: false
+let sslConfig: boolean | { rejectUnauthorized: boolean } = false;
+
+if (process.env.DATABASE_SSL === 'false' || isLocalhost || isRenderInternal) {
+  sslConfig = false;
+} else if (
+  process.env.DATABASE_SSL === 'true' ||
+  cleanConnectionString.includes('.render.com') ||
+  (!isLocalhost && !isRenderInternal)
+) {
+  sslConfig = { rejectUnauthorized: false };
+}
+
+// Helper to ensure target database exists on local setups
 async function ensureDatabaseExists() {
-  // Only check and create database on local PostgreSQL instances
-  if (!connectionString.includes('localhost') && !connectionString.includes('127.0.0.1')) {
+  if (!isLocalhost) {
     return;
   }
 
   try {
-    const url = new URL(connectionString);
+    const url = new URL(cleanConnectionString);
     const dbName = url.pathname.replace(/^\//, '');
     
-    // Connect to default 'postgres' database to check/create target database
-    const adminUrl = new URL(connectionString);
+    const adminUrl = new URL(cleanConnectionString);
     adminUrl.pathname = '/postgres';
 
     const client = new Client({ connectionString: adminUrl.toString() });
@@ -48,18 +70,24 @@ async function ensureDatabaseExists() {
 }
 
 export const pool = new Pool({
-  connectionString,
-  max: isProduction ? 20 : 10,
+  connectionString: cleanConnectionString,
+  max: 10,
   idleTimeoutMillis: 30000,
-  ssl: useSSL ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: 10000,
+  ssl: sslConfig,
 });
 
-export async function initDB() {
+export async function initDB(maxRetries = 5, retryDelayMs = 2500): Promise<void> {
   await ensureDatabaseExists();
 
-  const client = await pool.connect();
-  try {
-    console.log('[Database] Connected to PostgreSQL. Initializing schema...');
+  let lastError: any = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    let client: any = null;
+    try {
+      console.log(`[Database] Connecting to PostgreSQL (Attempt ${attempt}/${maxRetries})...`);
+      client = await pool.connect();
+      console.log('[Database] Connected to PostgreSQL. Initializing schema...');
 
     // 1. Admin Users Table
     await client.query(`
@@ -241,11 +269,21 @@ export async function initDB() {
       console.log('[Database] Seeded initial services.');
     }
 
-    console.log('[Database] Database initialization complete.');
-  } catch (err) {
-    console.error('[Database] Initialization error:', err);
-    throw err;
-  } finally {
-    client.release();
+      console.log('[Database] Database initialization complete.');
+      return;
+    } catch (err: any) {
+      lastError = err;
+      console.error(`[Database] Attempt ${attempt}/${maxRetries} failed: ${err.message}`);
+      if (attempt < maxRetries) {
+        console.log(`[Database] Retrying connection in ${retryDelayMs / 1000}s...`);
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
+    } finally {
+      if (client) {
+        client.release();
+      }
+    }
   }
+
+  throw new Error(`Failed to connect/initialize database after ${maxRetries} attempts: ${lastError?.message}`);
 }
